@@ -74,6 +74,45 @@ with st.sidebar:
         help="Number of most similar URLs to show for each Domain A URL"
     )
 
+    use_hybrid_scoring = st.checkbox(
+        "Use Hybrid Scoring (Recommended)",
+        value=True,
+        help="Combines semantic similarity with URL structure and page type matching to prevent mismatches like contact pages with blog posts"
+    )
+
+    if use_hybrid_scoring:
+        with st.expander("⚙️ Advanced: Scoring Weights"):
+            semantic_weight = st.slider(
+                "Semantic Weight",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.5,
+                step=0.1,
+                help="Weight for content similarity (embeddings)"
+            )
+
+            url_weight = st.slider(
+                "URL Weight",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.3,
+                step=0.1,
+                help="Weight for URL path similarity"
+            )
+
+            page_type_weight = st.slider(
+                "Page Type Weight",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.2,
+                step=0.1,
+                help="Weight for page type compatibility (prevents contact/blog mismatches)"
+            )
+    else:
+        semantic_weight = 1.0
+        url_weight = 0.0
+        page_type_weight = 0.0
+
     st.divider()
 
     st.subheader("📖 Instructions")
@@ -167,7 +206,13 @@ if domain_a_file and domain_b_file:
             try:
                 # Initialize components
                 embeddings_gen = EmbeddingsGenerator()
-                analyzer = SimilarityAnalyzer(top_k=top_k)
+                analyzer = SimilarityAnalyzer(
+                    top_k=top_k,
+                    use_hybrid_scoring=use_hybrid_scoring,
+                    semantic_weight=semantic_weight,
+                    url_weight=url_weight,
+                    page_type_weight=page_type_weight
+                )
 
                 # Generate or load embeddings for Domain A
                 if st.session_state.domain_a_mode == 'text':
@@ -195,11 +240,21 @@ if domain_a_file and domain_b_file:
                     st.session_state.embeddings_b
                 )
 
-                # Pair URLs
+                # Prepare titles and H1s for hybrid scoring
+                titles_a = st.session_state.domain_a_df.get('title', pd.Series([''] * len(st.session_state.domain_a_df))).fillna('').tolist()
+                titles_b = st.session_state.domain_b_df.get('title', pd.Series([''] * len(st.session_state.domain_b_df))).fillna('').tolist()
+                h1s_a = st.session_state.domain_a_df.get('h1', pd.Series([''] * len(st.session_state.domain_a_df))).fillna('').tolist()
+                h1s_b = st.session_state.domain_b_df.get('h1', pd.Series([''] * len(st.session_state.domain_b_df))).fillna('').tolist()
+
+                # Pair URLs with hybrid scoring
                 st.session_state.results_df = analyzer.pair_urls(
                     st.session_state.domain_a_df['url'].tolist(),
                     st.session_state.domain_b_df['url'].tolist(),
-                    similarity_matrix
+                    similarity_matrix,
+                    titles_a=titles_a,
+                    titles_b=titles_b,
+                    h1s_a=h1s_a,
+                    h1s_b=h1s_b
                 )
 
                 # Generate summary stats
@@ -211,6 +266,9 @@ if domain_a_file and domain_b_file:
 
             except Exception as e:
                 st.error(f"❌ Error during analysis: {str(e)}")
+                import traceback
+                with st.expander("🔍 Error Details"):
+                    st.code(traceback.format_exc())
                 st.stop()
 
         # Display results
@@ -275,11 +333,49 @@ if domain_a_file and domain_b_file:
 
             st.info(f"Showing {len(filtered_results)} of {len(st.session_state.results_df)} total pairs")
 
-            # Display results table
-            st.dataframe(
-                filtered_results,
-                use_container_width=True,
-                column_config={
+            # Select columns to display
+            if use_hybrid_scoring and 'page_type_a' in filtered_results.columns:
+                display_cols = [
+                    'domain_a_url',
+                    'domain_b_url',
+                    'similarity_score',
+                    'semantic_score',
+                    'url_score',
+                    'page_type_score',
+                    'page_type_a',
+                    'page_type_b',
+                    'rank'
+                ]
+                column_config = {
+                    "domain_a_url": st.column_config.TextColumn("Domain A URL", width="large"),
+                    "domain_b_url": st.column_config.TextColumn("Domain B URL", width="large"),
+                    "similarity_score": st.column_config.NumberColumn(
+                        "Overall (%)",
+                        format="%.1f%%",
+                        help="Hybrid similarity score"
+                    ),
+                    "semantic_score": st.column_config.NumberColumn(
+                        "Semantic (%)",
+                        format="%.1f%%",
+                        help="Content similarity score"
+                    ),
+                    "url_score": st.column_config.NumberColumn(
+                        "URL (%)",
+                        format="%.1f%%",
+                        help="URL structure similarity"
+                    ),
+                    "page_type_score": st.column_config.NumberColumn(
+                        "Type (%)",
+                        format="%.1f%%",
+                        help="Page type compatibility"
+                    ),
+                    "page_type_a": st.column_config.TextColumn("Type A", width="small"),
+                    "page_type_b": st.column_config.TextColumn("Type B", width="small"),
+                    "rank": st.column_config.NumberColumn("Rank")
+                }
+            else:
+                display_cols = ['domain_a_url', 'domain_b_url', 'similarity_score', 'rank']
+                column_config = {
                     "domain_a_url": st.column_config.TextColumn("Domain A URL", width="large"),
                     "domain_b_url": st.column_config.TextColumn("Domain B URL", width="large"),
                     "similarity_score": st.column_config.NumberColumn(
@@ -288,6 +384,12 @@ if domain_a_file and domain_b_file:
                     ),
                     "rank": st.column_config.NumberColumn("Rank")
                 }
+
+            # Display results table
+            st.dataframe(
+                filtered_results[display_cols] if all(col in filtered_results.columns for col in display_cols) else filtered_results,
+                use_container_width=True,
+                column_config=column_config
             )
 
     # Tab 3: Export Results

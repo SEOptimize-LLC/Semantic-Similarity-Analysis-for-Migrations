@@ -7,22 +7,47 @@ Calculates semantic similarity between URLs and pairs them based on content simi
 import pandas as pd
 import numpy as np
 import torch
-from typing import List
+from typing import List, Optional
 from sentence_transformers import util
 import streamlit as st
+from utils.page_classifier import PageClassifier
+from utils.url_similarity import URLSimilarityCalculator
 
 
 class SimilarityAnalyzer:
     """Analyzes semantic similarity between URL pairs from two domains."""
 
-    def __init__(self, top_k: int = 5):
+    def __init__(
+        self,
+        top_k: int = 5,
+        use_hybrid_scoring: bool = True,
+        semantic_weight: float = 0.5,
+        url_weight: float = 0.3,
+        page_type_weight: float = 0.2
+    ):
         """
         Initialize the similarity analyzer.
 
         Args:
             top_k: Number of top matches to return per URL
+            use_hybrid_scoring: Whether to use hybrid scoring (semantic + URL + page type)
+            semantic_weight: Weight for semantic similarity (0-1)
+            url_weight: Weight for URL similarity (0-1)
+            page_type_weight: Weight for page type compatibility (0-1)
         """
         self.top_k = top_k
+        self.use_hybrid_scoring = use_hybrid_scoring
+        self.semantic_weight = semantic_weight
+        self.url_weight = url_weight
+        self.page_type_weight = page_type_weight
+
+        # Initialize helper classes for hybrid scoring
+        if use_hybrid_scoring:
+            self.page_classifier = PageClassifier()
+            self.url_calculator = URLSimilarityCalculator()
+        else:
+            self.page_classifier = None
+            self.url_calculator = None
 
     def calculate_similarity_matrix(
         self,
@@ -58,7 +83,11 @@ class SimilarityAnalyzer:
         self,
         urls_a: List[str],
         urls_b: List[str],
-        similarity_matrix: np.ndarray
+        similarity_matrix: np.ndarray,
+        titles_a: Optional[List[str]] = None,
+        titles_b: Optional[List[str]] = None,
+        h1s_a: Optional[List[str]] = None,
+        h1s_b: Optional[List[str]] = None
     ) -> pd.DataFrame:
         """
         Create URL pairs based on similarity scores.
@@ -68,35 +97,108 @@ class SimilarityAnalyzer:
         Args:
             urls_a: List of URLs from Domain A
             urls_b: List of URLs from Domain B
-            similarity_matrix: Similarity matrix (shape: [len(urls_a), len(urls_b)])
+            similarity_matrix: Semantic similarity matrix (shape: [len(urls_a), len(urls_b)])
+            titles_a: Optional list of titles for Domain A (for page type classification)
+            titles_b: Optional list of titles for Domain B (for page type classification)
+            h1s_a: Optional list of H1s for Domain A (for page type classification)
+            h1s_b: Optional list of H1s for Domain B (for page type classification)
 
         Returns:
             DataFrame with columns:
                 - domain_a_url: URL from Domain A
                 - domain_b_url: URL from Domain B
-                - similarity_score: Similarity score (0-100%)
+                - similarity_score: Overall similarity score (0-100%)
+                - semantic_score: Semantic similarity component (0-100%)
+                - url_score: URL similarity component (0-100%)
+                - page_type_score: Page type compatibility component (0-100%)
+                - page_type_a: Page type for Domain A URL
+                - page_type_b: Page type for Domain B URL
                 - rank: Rank of match (1 = most similar)
         """
         results = []
 
-        with st.spinner(f"📊 Pairing URLs (top {self.top_k} matches per URL)..."):
-            for i, url_a in enumerate(urls_a):
-                # Get similarity scores for this URL
-                similarities = similarity_matrix[i]
+        # Classify page types if hybrid scoring enabled
+        if self.use_hybrid_scoring:
+            with st.spinner("🏷️ Classifying page types..."):
+                page_types_a = self.page_classifier.classify_batch(
+                    urls_a,
+                    titles_a,
+                    h1s_a
+                )
+                page_types_b = self.page_classifier.classify_batch(
+                    urls_b,
+                    titles_b,
+                    h1s_b
+                )
+            st.success("✅ Page types classified")
 
-                # Get top K indices (most similar)
-                top_indices = np.argsort(similarities)[::-1][:self.top_k]
+        with st.spinner(f"📊 Pairing URLs with hybrid scoring (top {self.top_k} matches per URL)..."):
+            for i, url_a in enumerate(urls_a):
+                # Calculate hybrid scores for this URL against all URLs in Domain B
+                hybrid_scores = []
+
+                for j, url_b in enumerate(urls_b):
+                    # Get semantic similarity
+                    semantic_score = similarity_matrix[i][j]
+
+                    if self.use_hybrid_scoring:
+                        # Calculate URL similarity
+                        url_score = self.url_calculator.calculate_similarity(url_a, url_b)
+
+                        # Get page type compatibility
+                        page_type_a = page_types_a[i]
+                        page_type_b = page_types_b[j]
+                        page_type_score = self.page_classifier.get_page_type_compatibility(
+                            page_type_a,
+                            page_type_b
+                        )
+
+                        # Combine scores with weights
+                        hybrid_score = (
+                            semantic_score * self.semantic_weight +
+                            url_score * self.url_weight +
+                            page_type_score * self.page_type_weight
+                        )
+                    else:
+                        # Use only semantic score
+                        hybrid_score = semantic_score
+                        url_score = 0.0
+                        page_type_score = 0.0
+                        page_type_a = 'unknown'
+                        page_type_b = 'unknown'
+
+                    hybrid_scores.append({
+                        'hybrid_score': hybrid_score,
+                        'semantic_score': semantic_score,
+                        'url_score': url_score,
+                        'page_type_score': page_type_score,
+                        'page_type_a': page_type_a if self.use_hybrid_scoring else 'unknown',
+                        'page_type_b': page_type_b if self.use_hybrid_scoring else 'unknown',
+                        'url_b': url_b,
+                        'index': j
+                    })
+
+                # Sort by hybrid score
+                hybrid_scores.sort(key=lambda x: x['hybrid_score'], reverse=True)
+
+                # Get top K matches
+                top_matches = hybrid_scores[:self.top_k]
 
                 # Create pairs
-                for rank, idx in enumerate(top_indices, start=1):
+                for rank, match in enumerate(top_matches, start=1):
                     results.append({
                         'domain_a_url': url_a,
-                        'domain_b_url': urls_b[idx],
-                        'similarity_score': round(similarities[idx] * 100, 2),
+                        'domain_b_url': match['url_b'],
+                        'similarity_score': round(match['hybrid_score'] * 100, 2),
+                        'semantic_score': round(match['semantic_score'] * 100, 2),
+                        'url_score': round(match['url_score'] * 100, 2),
+                        'page_type_score': round(match['page_type_score'] * 100, 2),
+                        'page_type_a': match['page_type_a'],
+                        'page_type_b': match['page_type_b'],
                         'rank': rank
                     })
 
-        st.success(f"✅ Created {len(results)} URL pairs")
+        st.success(f"✅ Created {len(results)} URL pairs with hybrid scoring")
 
         return pd.DataFrame(results)
 
